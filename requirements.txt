@@ -19,6 +19,8 @@ webdriver-manager==4.0.1
 beautifulsoup4==4.12.3
 undetected-chromedriver
 snscrape @ git+https://github.com/JustAnotherArchivist/snscrape.git
+twscrape
+
 
 # NLP Bahasa Indonesia
 PySastrawi>=1.0.0

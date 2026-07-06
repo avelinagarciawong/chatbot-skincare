@@ -2,6 +2,7 @@ import time
 import random
 import pandas as pd
 import os
+import re
 from datetime import datetime
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -11,37 +12,163 @@ from selenium.webdriver.support import expected_conditions as EC
 os.makedirs("data", exist_ok=True)
 
 # ── Konfigurasi ───────────────────────────────────────────
-KEYWORDS = [
-    "serum lokal indonesia",
-    "moisturizer lokal indonesia"
-    # "sunscreen lokal indonesia",
-    # "skincare somethinc",
-    # "skincare avoskin",
-    # "skincare wardah",
-    # "skincare npure",
-    # "skincare ms glow",
-]
+# Kategori Perawatan Wajah (Skincare)
+CATEGORY_URL = "https://shopee.co.id/Perawatan-Wajah-cat.11043145.11043253"
+# Halaman 1 s.d. 15 (index page dimulai dari 0 di Shopee)
+PAGES_TO_SCRAPE = list(range(15))
 
-TARGET_PRODUK = 200   # mulai dari 200 dulu, bisa ditambah
+TARGET_PRODUK = 500   # Jumlah target produk yang ingin dikumpulkan (disesuaikan menjadi 500)
 DELAY_MIN     = 2.0
 DELAY_MAX     = 4.0
+
+FILE_PRODUK = "data/raw_shopee_produk.csv"
+FILE_ULASAN = "data/raw_shopee_ulasan.csv"
+
+DEBUG_HTML       = True  # set False kalau sudah tidak perlu debug lagi
+DEBUG_HTML_DIR   = "data/debug_html"
+os.makedirs(DEBUG_HTML_DIR, exist_ok=True)
 
 
 def delay():
     time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
 
+def hapus_lock_files(profile_dir):
+    """Menghapus file lock dari profile Chrome agar tidak terjadi konflik atau error."""
+    lock_files = ["SingletonLock", "lockfile", "lock"]
+    for f_name in lock_files:
+        path = os.path.join(profile_dir, f_name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                print(f"    [+] Berhasil menghapus lock file: {path}")
+            except Exception as e:
+                print(f"    [-] Gagal menghapus lock file {path} (mungkin Chrome sedang berjalan): {e}")
+
+
+def check_and_solve_verification(driver):
+    """Mendeteksi apakah halaman saat ini adalah halaman verifikasi/blokir Shopee,
+    lalu meminta user menyelesaikannya secara manual sebelum melanjutkan.
+    """
+    url_aktif = driver.current_url
+    if "verify/traffic" in url_aktif or "verify" in url_aktif:
+        print("\n" + "!" * 60)
+        print(" 🛑 DETEKSI BOT / TRAFFIC VERIFICATION TERJADI!")
+        print(f" URL Terdeteksi: {url_aktif}")
+        print(" Silakan selesaikan CAPTCHA / Verifikasi di browser Chrome sekarang.")
+        print(" Setelah selesai verifikasi dan halaman normal kembali (atau masuk ke Shopee),")
+        print(" kembali ke terminal ini, lalu ketik 'lanjut' dan tekan ENTER.")
+        print("!" * 60 + "\n")
+        
+        user_input = ""
+        while user_input.strip().lower() != "lanjut":
+            user_input = input("Ketik 'lanjut' lalu tekan ENTER jika sudah selesai verifikasi di browser: ")
+            
+        # Refresh halaman untuk memastikan keadaan baru
+        print(" [!] Me-refresh halaman untuk verifikasi status...")
+        driver.refresh()
+        time.sleep(3)
+        
+        # Rekursif jika masih terdeteksi blokir
+        if "verify/traffic" in driver.current_url or "verify" in driver.current_url:
+            print(" [!] Browser masih mendeteksi halaman verifikasi/blokir.")
+            check_and_solve_verification(driver)
+        else:
+            print(" [+] Verifikasi terlewati, melanjutkan scraping...\n")
+
+
+def get_chrome_major_version():
+    """Mengambil major version Google Chrome yang terinstall di Windows."""
+    try:
+        import winreg
+        # 1. Coba dari HKEY_CURRENT_USER
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+            version, _ = winreg.QueryValueEx(key, "version")
+            return int(version.split(".")[0])
+        except:
+            pass
+            
+        # 2. Coba dari HKEY_LOCAL_MACHINE
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Google\Chrome\BLBeacon")
+            version, _ = winreg.QueryValueEx(key, "version")
+            return int(version.split(".")[0])
+        except:
+            pass
+            
+        # 3. Fallback HKEY_LOCAL_MACHINE Wow6432Node
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome")
+            version, _ = winreg.QueryValueEx(key, "DisplayVersion")
+            return int(version.split(".")[0])
+        except:
+            pass
+    except Exception as e:
+        print(f"    [Warning] Gagal mendeteksi versi Chrome via Registry: {e}")
+    return None
+
+
 def buat_driver():
     """Buat Chrome driver dengan setting anti-deteksi."""
+    import shutil
+    import sys
+    
+    profile_base = "C:/chatbot-skincare/chrome_profile"
+    profile_dir = profile_base
+    
+    reset = input(" Apakah Anda ingin mereset cache/cookies Chrome? (y untuk Ya / ENTER untuk Tidak): ").strip().lower()
+    if reset == "y":
+        # Hapus proses background agar tidak mengunci file
+        if sys.platform.startswith("win"):
+            import subprocess
+            print("    [*] Menutup proses Chrome background...")
+            subprocess.run(["taskkill", "/f", "/im", "chrome.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["taskkill", "/f", "/im", "chromedriver.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2.0)
+            
+        hapus_lock_files(profile_dir)
+        try:
+            shutil.rmtree(profile_dir)
+            os.makedirs(profile_dir, exist_ok=True)
+            print(" [+] Profile Chrome berhasil direset. Sesi akan mulai dari awal.")
+        except Exception as e:
+            print(f" [!] Gagal menghapus folder profile lama karena sedang dikunci oleh proses lain.")
+            # Fallback ke folder baru
+            suffix = 2
+            while True:
+                new_profile_dir = f"{profile_base}_v{suffix}"
+                try:
+                    if os.path.exists(new_profile_dir):
+                        shutil.rmtree(new_profile_dir)
+                    os.makedirs(new_profile_dir, exist_ok=True)
+                    profile_dir = new_profile_dir
+                    print(f" [+] Menggunakan folder profile alternatif baru: {profile_dir} (bebas lock & cookie lama!)")
+                    break
+                except Exception:
+                    suffix += 1
+    else:
+        os.makedirs(profile_dir, exist_ok=True)
+        hapus_lock_files(profile_dir)
+
     options = uc.ChromeOptions()
-    
-    # Jangan pakai headless dulu agar lebih mudah debug
-    # options.add_argument("--headless")
-    
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    
-    driver = uc.Chrome(options=options)
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
+    major_version = get_chrome_major_version()
+    if major_version:
+        print(f"[*] Mendeteksi Google Chrome versi: {major_version}")
+        try:
+            # Coba pakai versi spesifik
+            driver = uc.Chrome(options=options, version_main=major_version)
+        except Exception:
+            # Fallback ke default patcher jika gagal
+            print("    [!] Gagal menginisialisasi dengan versi Chrome spesifik. Mencoba default patcher...")
+            driver = uc.Chrome(options=options)
+    else:
+        print("[*] Menggunakan default undetected_chromedriver...")
+        driver = uc.Chrome(options=options)
     return driver
 
 
@@ -52,10 +179,76 @@ def scroll_halaman(driver, kali=3):
         time.sleep(1.5)
 
 
+def debug_simpan_html(driver, page: int):
+    """
+    [DEBUG] Simpan HTML mentah halaman kategori + outerHTML dari beberapa
+    card produk pertama, supaya bisa dibaca untuk memperbaiki selector.
+    Aktif/nonaktif lewat flag DEBUG_HTML di atas.
+    """
+    if not DEBUG_HTML:
+        return
+
+    try:
+        # 1) Simpan seluruh HTML halaman
+        html_path = os.path.join(DEBUG_HTML_DIR, f"halaman_{page}.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        print(f"    🐞 [debug] HTML halaman disimpan: {html_path}")
+
+        # 2) Coba ambil beberapa kandidat "card" produk dengan selector yang lebar,
+        #    lalu simpan outerHTML-nya satu per satu (3 contoh saja) agar mudah dibaca
+        kandidat_selectors = [
+            "div[data-sqe='item']",
+            "li.shopee-search-item-result__item",
+            "div.shopee-search-item-result__item",
+            "[class*='shopee-search-item-result']",
+            "a[href*='/product/']",
+            "a[href*='-i.']",
+        ]
+
+        contoh_disimpan = 0
+        for sel in kandidat_selectors:
+            try:
+                elems = driver.find_elements(By.CSS_SELECTOR, sel)
+            except:
+                elems = []
+
+            if not elems:
+                continue
+
+            print(f"    🐞 [debug] selector '{sel}' → {len(elems)} elemen ditemukan")
+
+            for i, el in enumerate(elems[:3]):
+                try:
+                    outer = driver.execute_script(
+                        "return arguments[0].outerHTML;", el)
+                except:
+                    continue
+
+                sel_aman = re.sub(r'[^a-zA-Z0-9]', '_', sel)[:40]
+                nama_file = f"card_page{page}_{sel_aman}_{i}.html"
+
+                card_path = os.path.join(DEBUG_HTML_DIR, nama_file)
+                with open(card_path, "w", encoding="utf-8") as f:
+                    f.write(outer)
+                contoh_disimpan += 1
+
+            # cukup ambil 1 selector yang berhasil saja per halaman supaya tidak kebanyakan file
+            break
+
+        if contoh_disimpan:
+            print(f"    🐞 [debug] {contoh_disimpan} contoh card produk disimpan ke {DEBUG_HTML_DIR}/")
+        else:
+            print("    🐞 [debug] Tidak ada elemen card yang cocok dengan selector kandidat manapun")
+
+    except Exception as e:
+        print(f"    🐞 [debug] Gagal menyimpan HTML debug: {e}")
+
+
 def ambil_produk_dari_halaman(driver) -> list:
-    """Ambil semua produk yang tampil di halaman pencarian dengan selector cadangan."""
+    """Ambil semua produk (termasuk link card produknya) yang tampil di halaman pencarian."""
     produk_list = []
-    
+
     # Coba beberapa selector umum untuk item hasil pencarian Shopee
     selectors = [
         "div[data-sqe='item']",
@@ -64,7 +257,7 @@ def ambil_produk_dari_halaman(driver) -> list:
         "[class*='shopee-search-item-result']",
         "a[href*='/product/']"
     ]
-    
+
     items = []
     for selector in selectors:
         try:
@@ -77,16 +270,42 @@ def ambil_produk_dari_halaman(driver) -> list:
                 break
         except:
             continue
-            
+
     if not items:
         print("    ✗ Produk tidak ditemukan di halaman ini")
         return []
 
+    # Lencana promo untuk disaring
+    badge_labels = {"Garansi Harga Terbaik", "Pilih Lokal", "Stok Terbatas", "Star+", "Star", "Mall", "Grosir", "Cashback", "Diskon"}
+
     for item in items:
         try:
-            # Nama produk
+            # 1. Link produk (card)
+            link = ""
+            try:
+                if item.tag_name == "a":
+                    link = item.get_attribute("href")
+                else:
+                    link = item.find_element(By.TAG_NAME, "a").get_attribute("href")
+            except:
+                link = ""
+
+            # Lewati produk yang tidak punya link (misal skeleton card)
+            if not link:
+                continue
+
+            # 2. Nama produk
+            # Sesuai saran, nama produk ada di div dengan class line-clamp-2 atau whitespace-normal
             nama = ""
-            for name_sel in ["[data-sqe='name']", "div[class*='ellipsis']", "div[class*='name']", "div[class*='title']"]:
+            name_selectors = [
+                "div[class*='line-clamp-2']",
+                "div[class*='whitespace-normal']",
+                "[class*='line-clamp-2']",
+                "[data-sqe='name']",
+                "div.ellipsis",
+                "div[class*='ellipsis']"
+            ]
+            for name_sel in name_selectors:
                 try:
                     nama = item.find_element(By.CSS_SELECTOR, name_sel).text.strip()
                     if nama:
@@ -94,20 +313,31 @@ def ambil_produk_dari_halaman(driver) -> list:
                 except:
                     continue
 
-            if not nama:
+            # Lewati skeleton card atau card badge iklan yang salah deteksi
+            if not nama or nama in badge_labels or len(nama) < 8:
                 continue
 
-            # Harga
+            # 3. Harga
+            # Sesuai saran, harga dipecah jadi span Rp dan nominalnya. Kita ambil parent dari span Rp untuk nominal gabungan.
             harga = ""
-            for price_sel in ["[data-sqe='price']", "span[class*='price']", "div[class*='price']", "[class*='Price']"]:
-                try:
-                    harga = item.find_element(By.CSS_SELECTOR, price_sel).text.strip()
-                    if harga:
-                        break
-                except:
-                    continue
+            try:
+                rp_elem = item.find_element(By.XPATH, ".//span[text()='Rp']")
+                parent_elem = rp_elem.find_element(By.XPATH, "..")
+                harga = parent_elem.text.strip().replace("\n", "")
+            except:
+                # Fallback ke selector kelas harga jika XPath gagal
+                for price_sel in ["[data-sqe='price']", "span[class*='price']", "div[class*='price']", "[class*='Price']", "[class*='text-base']"]:
+                    try:
+                        harga = item.find_element(By.CSS_SELECTOR, price_sel).text.strip().replace("\n", "")
+                        if harga:
+                            break
+                    except:
+                        continue
 
-            # Rating
+            if not harga:
+                continue
+
+            # 4. Rating
             rating = ""
             for rating_sel in ["span[class*='rating']", "div[class*='rating']", "[class*='Rating']"]:
                 try:
@@ -117,7 +347,7 @@ def ambil_produk_dari_halaman(driver) -> list:
                 except:
                     continue
 
-            # Terjual
+            # 5. Terjual
             terjual = ""
             for sold_sel in ["[data-sqe='sold']", "div[class*='sold']", "[class*='Sold']", "[class*='sold']"]:
                 try:
@@ -126,16 +356,6 @@ def ambil_produk_dari_halaman(driver) -> list:
                         break
                 except:
                     continue
-
-            # Link produk
-            link = ""
-            try:
-                if item.tag_name == "a":
-                    link = item.get_attribute("href")
-                else:
-                    link = item.find_element(By.TAG_NAME, "a").get_attribute("href")
-            except:
-                link = ""
 
             produk_list.append({
                 "nama_produk": nama,
@@ -154,140 +374,219 @@ def ambil_produk_dari_halaman(driver) -> list:
 
 
 def ambil_ulasan_produk(driver, link: str, nama_produk: str) -> list:
-    """Buka halaman produk dan ambil ulasannya."""
+    """Ambil ulasan menggunakan Ratings API via fetch latar belakang tanpa me-reload halaman browser."""
     ulasan_list = []
 
+    # Ekstrak shop_id dan item_id dari link produk
+    shop_id, item_id = None, None
     try:
-        driver.get(link)
-        delay()
-        scroll_halaman(driver, kali=5)
+        # Pola 1: i.SHOP_ID.ITEM_ID
+        match = re.search(r'i\.(\d+)\.(\d+)', link)
+        if match:
+            shop_id, item_id = match.group(1), match.group(2)
+        else:
+            # Pola 2: /product/SHOP_ID/ITEM_ID
+            match = re.search(r'product/(\d+)/(\d+)', link)
+            if match:
+                shop_id, item_id = match.group(1), match.group(2)
+    except Exception as e:
+        print(f"    ✗ Gagal mengekstrak ID dari URL: {e}")
 
-        # Cari section ulasan
-        ulasan_elements = []
-        review_selectors = [
-            "div[data-cmtid]",
-            "div.shopee-product-comment-list > div",
-            "div.shopee-product-rating",
-            "div[class*='shopee-product-rating']",
-            "div[class*='product-rating']",
-            "div[class*='comment']"
-        ]
+    if not shop_id or not item_id:
+        print(f"    ✗ Format URL tidak didukung untuk API: {link}")
+        return []
+
+    try:
+        # Gunakan API internal Shopee untuk mengambil rating bintang & ulasan teks (limit 50)
+        api_url = f"https://shopee.co.id/api/v2/item/get_ratings?filter=0&limit=50&offset=0&shopid={shop_id}&itemid={item_id}&type=0"
+
+        # Eksekusi fetch Javascript di context browser agar bypass CORS dan memanfaatkan cookies user aktif
+        script = f"""
+        return fetch("{api_url}", {{
+            headers: {{
+                "x-api-source": "pc-pc",
+                "x-requested-with": "XMLHttpRequest",
+                "x-shopee-language": "id"
+            }}
+        }})
+            .then(response => response.json())
+            .then(data => (data && data.data) ? data.data.ratings : null)
+            .catch(err => null);
+        """
         
-        for selector in review_selectors:
-            try:
-                ulasan_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if ulasan_elements:
-                    break
-            except:
-                continue
+        # Coba fetch langsung tanpa navigasi browser
+        ratings = driver.execute_script(script)
 
-        if not ulasan_elements:
-            return []
+        # Jika API menolak / diblokir (ratings is None), lakukan fallback memuat halaman fisik sekali
+        if ratings is None:
+            print("    [!] API Fetch ditolak/kosong. Mencoba memuat halaman produk secara fisik...")
+            driver.get(link)
+            delay()
+            check_and_solve_verification(driver)
+            ratings = driver.execute_script(script)
 
-        for u in ulasan_elements[:8]:   # max 8 ulasan per produk
-            try:
-                # Ambil teks ulasan
-                teks = ""
-                text_selectors = [
-                    "div.YNedDV",
-                    "div[class*='YNedDV']",
-                    "div.meQyXP",
-                    "div[class*='item-content']",
-                    "div[class*='content']",
-                    "div[class*='rating__main']",
-                    "div[class*='comment']",
-                    "div.shopee-product-rating__main"
-                ]
-                for text_sel in text_selectors:
-                    try:
-                        teks = u.find_element(By.CSS_SELECTOR, text_sel).text.strip()
-                        if teks:
-                            break
-                    except:
-                        continue
+        if ratings:
+            for rate in ratings:
+                teks = rate.get("comment", "")
+                bintang = rate.get("rating_star", 0)
 
-                # Ambil jumlah bintang
-                bintang = 0
-                star_selectors = [
-                    "svg.icon-rating-solid",
-                    "svg[class*='icon-rating-solid']",
-                    "svg[class*='filled']",
-                    "svg[class*='star']",
-                    "div[class*='star']"
-                ]
-                for star_sel in star_selectors:
-                    try:
-                        stars = u.find_elements(By.CSS_SELECTOR, star_sel)
-                        if stars:
-                            bintang = len(stars)
-                            break
-                    except:
-                        continue
-
-                if teks and len(teks) > 5:
+                # Filter ulasan: memiliki teks dan panjang > 5 karakter
+                if teks and len(teks.strip()) > 5:
                     ulasan_list.append({
                         "nama_produk":  nama_produk,
-                        "teks_ulasan":  teks,
+                        "link_produk":  link,
+                        "teks_ulasan":  teks.strip().replace("\n", " "),
                         "rating":       bintang,
                         "sumber":       "shopee",
                         "scraped_at":   datetime.now().isoformat(),
                     })
-            except:
-                continue
+        else:
+            print("    ✗ Tidak ada ulasan yang didapat dari API")
 
     except Exception as e:
-        print(f"    ✗ Error ambil ulasan: {e}")
+        print(f"    ✗ Error ambil ulasan via API: {e}")
 
     return ulasan_list
 
 
-# ─────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────
-def main():
-    print("=" * 55)
-    print("  SHOPEE SELENIUM SCRAPER")
-    print("=" * 55)
-    print(f"  Target  : {TARGET_PRODUK} produk")
-    print(f"  Browser : Chrome akan terbuka otomatis\n")
+def ambil_produk_via_api(driver, match_id: str, page: int, sort_by: str = "relevancy") -> list:
+    """Ambil daftar produk di halaman kategori menggunakan fetch API internal Shopee."""
+    limit = 60
+    offset = page * limit
+    api_url = f"https://shopee.co.id/api/v4/search/search_items?by={sort_by}&limit={limit}&match_id={match_id}&newest={offset}&order=desc&page_type=search&scenario=PAGE_OTHERS&version=5"
+    
+    script = f"""
+    return fetch("{api_url}", {{
+        headers: {{
+            "x-api-source": "pc-pc",
+            "x-requested-with": "XMLHttpRequest",
+            "x-shopee-language": "id"
+        }}
+    }})
+        .then(response => response.json())
+        .then(data => data.items || [])
+        .catch(err => null);
+    """
+    
+    try:
+        items = driver.execute_script(script)
+        produk_list = []
+        if items:
+            for item in items:
+                basic = item.get("item_basic")
+                if not basic:
+                    continue
+                
+                itemid = basic.get("itemid")
+                shopid = basic.get("shopid")
+                nama = basic.get("name", "").strip()
+                
+                # Konversi harga (Shopee menyimpan harga dikali 100.000)
+                price_raw = basic.get("price")
+                if price_raw is not None:
+                    harga = f"Rp{int(price_raw / 100000):,}".replace(",", ".")
+                else:
+                    harga = ""
+                    
+                rating_star = basic.get("item_rating", {}).get("rating_star", 0.0)
+                rating = f"{rating_star:.1f}" if rating_star else ""
+                
+                sold = basic.get("historical_sold", 0)
+                terjual = f"{sold} terjual" if sold else ""
+                
+                # Tautkan URL produk
+                # Format standar Shopee: https://shopee.co.id/Nama-Produk-i.shopid.itemid
+                nama_slug = re.sub(r'[^a-zA-Z0-9]+', '-', nama).strip("-")
+                link = f"https://shopee.co.id/{nama_slug}-i.{shopid}.{itemid}"
+                
+                produk_list.append({
+                    "nama_produk": nama,
+                    "harga":       harga,
+                    "rating":      rating,
+                    "terjual":     terjual,
+                    "link":        link,
+                    "scraped_at":  datetime.now().isoformat(),
+                    "sumber":      "shopee",
+                })
+        return produk_list
+    except Exception as e:
+        print(f"    ✗ Error ambil produk via API: {e}")
+        return []
 
-    driver = buat_driver()
+
+# ─────────────────────────────────────────────────────────
+# TAHAP 1 — Scraping produk per halaman (+ kumpulkan link)
+# ─────────────────────────────────────────────────────────
+def tahap1_scrape_produk(driver) -> pd.DataFrame:
+    print("\n" + "=" * 55)
+    print("  TAHAP 1: SCRAPING PRODUK PER HALAMAN")
+    print("=" * 55)
+    print(f"  Target  : {TARGET_PRODUK} produk\n")
+
     semua_produk = []
-    semua_ulasan = []
     produk_seen  = set()
 
-    try:
-        # Buka Shopee dulu agar dapat cookies
-        print("[*] Membuka Shopee...")
-        driver.get("https://shopee.co.id")
-        
-        # Jeda agar user bisa login terlebih dahulu
-        print("\n" + "=" * 60)
-        print(" SILAKAN LOGIN / SELESAIKAN VERIFIKASI DI BROWSER CHROME SEKARANG")
-        print(" Setelah selesai login dan masuk ke beranda Shopee,")
-        print(" kembali ke terminal ini dan tekan ENTER untuk mulai scraping.")
-        print("=" * 60 + "\n")
-        input("Tekan ENTER setelah Anda selesai login...")
+    # Ekstrak category_id dari CATEGORY_URL
+    match = re.search(r'cat\.\d+\.(\d+)', CATEGORY_URL)
+    category_id = match.group(1) if match else "11043253"
 
-        for keyword in KEYWORDS:
+    # Kalau sudah ada file sebelumnya, lanjutkan (resume) berdasarkan link yang sudah tersimpan
+    if os.path.exists(FILE_PRODUK):
+        df_lama = pd.read_csv(FILE_PRODUK)
+        if not df_lama.empty:
+            semua_produk = df_lama.to_dict("records")
+            produk_seen  = set(df_lama["nama_produk"].tolist())
+            print(f"  ↻ Resume: {len(semua_produk)} produk sudah ada di {FILE_PRODUK}")
+
+    # Menggunakan beberapa metode sorting agar bisa melewati limit 500 produk dari Shopee
+    sort_options = ["relevancy", "sales", "ctime"]
+
+    for sort_opt in sort_options:
+        if len(semua_produk) >= TARGET_PRODUK:
+            break
+
+        print(f"\n=======================================================")
+        print(f"  MENGGUNAKAN METODE SORTING: '{sort_opt.upper()}'")
+        print(f"=======================================================")
+
+        for page in PAGES_TO_SCRAPE:
             if len(semua_produk) >= TARGET_PRODUK:
                 break
 
-            print(f"\n🔍  Keyword: '{keyword}'")
+            print(f"\n🔍  Scraping Halaman Kategori ({sort_opt}): Halaman {page + 1} (page={page})")
 
-            # Navigasi ke halaman pencarian
-            url_search = (
-                f"https://shopee.co.id/search?keyword="
-                f"{keyword.replace(' ', '%20')}"
-            )
-            driver.get(url_search)
+            # Menggunakan query params untuk pencarian/kategori agar refresh token
+            url_kategori = f"{CATEGORY_URL}?page={page}&sortBy={sort_opt}"
+            driver.get(url_kategori)
             delay()
-            scroll_halaman(driver, kali=5)
 
-            # Ambil produk dari halaman ini
-            produk_halaman = ambil_produk_dari_halaman(driver)
-            print(f"    {len(produk_halaman)} produk ditemukan")
+            # Cek dan tunggu jika ada halaman verifikasi
+            check_and_solve_verification(driver)
 
+            # Coba ambil via API internal dulu (lebih cepat dan aman dari skeleton loading)
+            print("    🔎 Mengambil produk via Shopee API...")
+            produk_halaman = ambil_produk_via_api(driver, category_id, page, sort_by=sort_opt)
+
+            # Jika API mengembalikan kosong (biasanya karena limit offset/halaman di Shopee),
+            # coba fallback ke DOM. Jika DOM juga kosong, maka break sort_opt ini
+            if not produk_halaman:
+                print("    ⚠ Gagal mengambil via API. Mencoba fallback ke scroll & DOM selector...")
+                scroll_halaman(driver, kali=5)
+                # [DEBUG] Simpan HTML debug untuk dianalisis
+                debug_simpan_html(driver, page)
+                produk_halaman = ambil_produk_dari_halaman(driver)
+                print(f"    [Fallback] {len(produk_halaman)} produk ditemukan via DOM")
+                
+                # Jika fallback juga kosong, artinya halaman kategori memang sudah habis
+                if not produk_halaman:
+                    print("    ⚠ Halaman kosong via DOM & API. Selesai untuk sorting ini, pindah ke sorting berikutnya...")
+                    break
+            else:
+                print(f"    ✓ {len(produk_halaman)} produk ditemukan via API")
+                # [DEBUG] Tetap simpan HTML untuk keperluan debug
+                debug_simpan_html(driver, page)
+
+            produk_baru_di_halaman = 0
             for produk in produk_halaman:
                 if len(semua_produk) >= TARGET_PRODUK:
                     break
@@ -298,43 +597,205 @@ def main():
 
                 produk_seen.add(nama)
                 semua_produk.append(produk)
+                produk_baru_di_halaman += 1
 
-                # Ambil ulasan kalau ada link
-                if produk.get("link"):
-                    ulasan = ambil_ulasan_produk(
-                        driver, produk["link"], nama
-                    )
-                    semua_ulasan.extend(ulasan)
-                    print(f"    ✓ {nama[:40]}... → {len(ulasan)} ulasan")
+            print(f"    ✓ {produk_baru_di_halaman} produk baru ditambahkan "
+                  f"(total: {len(semua_produk)}/{TARGET_PRODUK})")
 
-                delay()
+            # Simpan progress setiap selesai 1 halaman
+            pd.DataFrame(semua_produk).to_csv(FILE_PRODUK, index=False)
+            print(f"    💾 Tersimpan ke {FILE_PRODUK}")
 
-                # Simpan progress setiap 10 produk
-                if len(semua_produk) % 10 == 0:
-                    pd.DataFrame(semua_produk).to_csv(
-                        "data/raw_shopee_produk.csv", index=False)
-                    pd.DataFrame(semua_ulasan).to_csv(
-                        "data/raw_shopee_ulasan.csv", index=False)
-                    print(f"\n  💾 Progress: {len(semua_produk)} produk, "
-                          f"{len(semua_ulasan)} ulasan tersimpan\n")
+    df_produk = pd.DataFrame(semua_produk)
+    df_produk.to_csv(FILE_PRODUK, index=False)
+
+    print("\n" + "-" * 55)
+    print(f"  ✓ TAHAP 1 SELESAI — {len(df_produk)} produk → {FILE_PRODUK}")
+    print("-" * 55)
+
+    return df_produk
+
+
+# ─────────────────────────────────────────────────────────
+# TAHAP 2 — Buka tiap link produk satu per satu, scrape ulasan
+# ─────────────────────────────────────────────────────────
+def parse_rating_untuk_sort(rating_val):
+    """Ubah rating jadi angka buat sorting. Yang kosong/tidak valid dianggap
+    prioritas tinggi juga (ditaruh di depan bareng rating rendah) karena
+    belum tentu produk itu bagus — perlu dicek juga."""
+    try:
+        return float(rating_val)
+    except (ValueError, TypeError):
+        return 0.0  # rating kosong -> prioritas tinggi (ikut discrape duluan)
+
+
+def urutkan_produk_prioritas(df_produk: pd.DataFrame) -> pd.DataFrame:
+    """Urutkan produk: rating rendah/kosong duluan, rating 5 sempurna belakangan.
+    Tujuannya supaya ulasan yang terkumpul duluan lebih beragam."""
+    df = df_produk.copy()
+    df["_rating_sort"] = df["rating"].apply(parse_rating_untuk_sort)
+    df = df.sort_values("_rating_sort", ascending=True).drop(columns=["_rating_sort"])
+    return df.reset_index(drop=True)
+
+
+def tahap2_scrape_ulasan_v2(driver, df_produk: pd.DataFrame):
+    """Versi revisi: memproses ulasan berdasarkan urutan asli CSV, mendukung kelanjutan indeks."""
+    FILE_ULASAN = "data/raw_shopee_ulasan.csv"
+
+    print("\n" + "=" * 55)
+    print("  TAHAP 2 (REVISI): SCRAPING ULASAN PER PRODUK")
+    print("=" * 55)
+
+    total_asli = len(df_produk)
+    print(f"  Total produk asli di CSV: {total_asli}")
+
+    # Input indeks awal untuk memulai dari baris tertentu di CSV
+    indeks_awal_input = input("  Masukkan indeks produk awal untuk memulai (misal: 410, atau tekan ENTER untuk mulai dari 0): ").strip()
+    indeks_awal = 0
+    if indeks_awal_input.isdigit():
+        indeks_awal = int(indeks_awal_input)
+
+    if indeks_awal > 0:
+        df_produk = df_produk.iloc[indeks_awal:]
+        print(f"  ⏭️  Memotong data produk, memulai dari indeks ke-{indeks_awal} (tersisa {len(df_produk)} produk)")
+    else:
+        print("  ▶️  Memulai dari indeks 0")
+
+    semua_ulasan = []
+    link_sudah_discrape = set()
+
+    # Resume: produk yang sudah pernah discrape kemarin otomatis dilewati
+    import os
+    if os.path.exists(FILE_ULASAN):
+        df_lama = pd.read_csv(FILE_ULASAN)
+        if not df_lama.empty and "link_produk" in df_lama.columns:
+            semua_ulasan = df_lama.to_dict("records")
+            link_sudah_discrape = set(df_lama["link_produk"].dropna().tolist())
+            print(f"  ↻ Resume: {len(link_sudah_discrape)} produk sudah pernah discrape, akan dilewati\n")
+
+    for idx, row in df_produk.iterrows():
+        link = row.get("link", "")
+        nama = row.get("nama_produk", "")
+        rating = row.get("rating", "")
+
+        if not link:
+            continue
+        if link in link_sudah_discrape:
+            continue
+
+        # Tambahkan jeda lebih lama setiap 15 produk agar meniru pola manusia beristirahat
+        if idx > 0 and idx % 15 == 0:
+            jeda_panjang = random.uniform(20.0, 45.0)
+            print(f"\n☕ [Istirahat] Jeda panjang selama {jeda_panjang:.1f} detik untuk menghindari deteksi bot...")
+            time.sleep(jeda_panjang)
+
+        print(f"  [{idx + 1}/{total_asli}] 🔎 (rating: {rating}) {nama[:40]}...")
+
+        # Panggil fungsi ambil_ulasan_produk() yang SAMA seperti script asli kamu
+        # (import dari file utama atau copy-paste fungsinya di sini)
+        ulasan = ambil_ulasan_produk(driver, link, nama)
+        semua_ulasan.extend(ulasan)
+        link_sudah_discrape.add(link)
+
+        print(f"      ✓ {len(ulasan)} ulasan didapat (total terkumpul: {len(semua_ulasan)})")
+
+        import time, random
+        time.sleep(random.uniform(2.0, 4.0))
+
+        # Simpan progress tiap 10 produk
+        if (idx + 1) % 10 == 0:
+            pd.DataFrame(semua_ulasan).to_csv(FILE_ULASAN, index=False)
+            print(f"      💾 Progress tersimpan: {len(semua_ulasan)} ulasan total\n")
+
+    df_ulasan = pd.DataFrame(semua_ulasan)
+    df_ulasan.to_csv(FILE_ULASAN, index=False)
+
+    print("\n" + "-" * 55)
+    print(f"  ✓ TAHAP 2 (REVISI) SELESAI — {len(df_ulasan)} ulasan → {FILE_ULASAN}")
+    print("-" * 55)
+
+    return df_ulasan
+
+# ─────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────
+def main():
+    print("=" * 55)
+    print("  SHOPEE SELENIUM SCRAPER (2 TAHAP)")
+    print("=" * 55)
+
+    skip_tahap1 = False
+    if os.path.exists(FILE_PRODUK):
+        print("\n" + "=" * 55)
+        print("  DATA PRODUK TERSEDIA:")
+        print("  File 'data/raw_shopee_produk.csv' sudah ditemukan.")
+        print("  [1] Lompati Tahap 1, langsung scrape ulasan (Tahap 2) dari CSV ini.")
+        print("  [2] Mulai ulang dari awal (Hapus data lama & Scrape produk baru).")
+        print("=" * 55)
+        pilihan_tahap = input("  Pilih tindakan (1 / 2, default 1): ").strip()
+        if pilihan_tahap != "2":
+            skip_tahap1 = True
+
+    driver = buat_driver()
+
+    try:
+        if not skip_tahap1:
+            # Buka Shopee dulu agar dapat cookies & bisa login manual
+            print("\n[*] Membuka Shopee...")
+            driver.get("https://shopee.co.id")
+            
+            # Cek dan tunggu jika ada halaman verifikasi saat awal masuk
+            check_and_solve_verification(driver)
+
+            print("\n" + "=" * 60)
+            print(" SILAKAN LOGIN / SELESAIKAN VERIFIKASI DI BROWSER CHROME SEKARANG")
+            print(" Setelah selesai login dan masuk ke beranda Shopee,")
+            print(" kembali ke terminal ini untuk memulai scraping.")
+            print("=" * 60 + "\n")
+            
+            # Mencegah bypass otomatis akibat buffer tombol enter dengan mewajibkan ketik 'mulai'
+            user_input = ""
+            while user_input.strip().lower() != "mulai":
+                user_input = input("Ketik 'mulai' lalu tekan ENTER jika Anda sudah selesai login di Chrome: ")
+
+            df_produk = tahap1_scrape_produk(driver)
+
+            if df_produk.empty:
+                print("\n  ⚠ Tidak ada produk yang berhasil diambil.")
+                return
+        else:
+            print("\n[+] Membaca daftar produk dari data/raw_shopee_produk.csv...")
+            df_produk = pd.read_csv(FILE_PRODUK)
+            
+            # PENTING: Buka Shopee homepage sekali di awal agar origin browser diset ke shopee.co.id
+            print("\n[*] Menghubungkan browser ke Shopee homepage untuk inisialisasi session...")
+            driver.get("https://shopee.co.id")
+            check_and_solve_verification(driver)
+
+        # ── TAHAP 2 ──
+        tahap2_scrape_ulasan_v2(driver, df_produk)
 
     except KeyboardInterrupt:
-        print("\n\n  ⚠ Dihentikan manual — menyimpan data...")
+        print("\n\n  ⚠ Dihentikan manual — data yang sudah tersimpan tetap aman "
+              "(progress sudah disimpan bertahap).")
 
     finally:
-        driver.quit()
-
-        # Simpan final
-        df_produk = pd.DataFrame(semua_produk)
-        df_ulasan = pd.DataFrame(semua_ulasan)
-
-        df_produk.to_csv("data/raw_shopee_produk.csv", index=False)
-        df_ulasan.to_csv("data/raw_shopee_ulasan.csv", index=False)
-
         print("\n" + "=" * 55)
-        print(f"  ✓ Produk : {len(df_produk)} → data/raw_shopee_produk.csv")
-        print(f"  ✓ Ulasan : {len(df_ulasan)} → data/raw_shopee_ulasan.csv")
+        print("  SELESAI (Tahap 1 & 2)")
+        if os.path.exists(FILE_PRODUK):
+            print(f"  ✓ Produk : {FILE_PRODUK}")
+        if os.path.exists(FILE_ULASAN):
+            print(f"  ✓ Ulasan : {FILE_ULASAN}")
         print("=" * 55)
+
+        # Biarkan browser tetap terbuka agar user bisa melihat dan tidak memicu WinError 6 secara tiba-tiba
+        print("\n[+] Browser dibiarkan tetap terbuka.")
+        input("Tekan ENTER di terminal ini untuk menutup browser Chrome dan keluar...")
+        
+        try:
+            driver.quit()
+        except:
+            pass
 
 
 if __name__ == "__main__":
